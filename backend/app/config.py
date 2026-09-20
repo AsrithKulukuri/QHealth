@@ -12,12 +12,14 @@ DISCLAIMER = (
     "treatment, or clinical validation."
 )
 
+import tempfile
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="QHEALTH_", env_file=PROJECT_ROOT / ".env", extra="ignore")
     storage_root: Path = PROJECT_ROOT
     api_token: str = ""
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080,http://127.0.0.1:8080"
-    trusted_hosts: str = "localhost,127.0.0.1,backend,testserver"
+    trusted_hosts: str = "localhost,127.0.0.1,backend,testserver,*.vercel.app,vercel.app"
     upload_limit_mb: int = Field(default=20, ge=1, le=100)
     max_rows: int = Field(default=100000, ge=20, le=1000000)
     max_columns: int = Field(default=200, ge=2, le=500)
@@ -35,7 +37,19 @@ class Settings(BaseSettings):
 
     @property
     def root(self) -> Path:
-        return (PROJECT_ROOT / self.storage_root).resolve()
+        resolved = (PROJECT_ROOT / self.storage_root).resolve()
+        # In serverless environments (e.g. Vercel), the workspace is read-only.
+        # Fallback to temp directory if root is not writable.
+        try:
+            resolved.mkdir(parents=True, exist_ok=True)
+            test_file = resolved / ".write_test"
+            test_file.touch(exist_ok=True)
+            test_file.unlink(missing_ok=True)
+            return resolved
+        except (OSError, PermissionError):
+            tmp = Path(tempfile.gettempdir()) / "qhealth"
+            tmp.mkdir(parents=True, exist_ok=True)
+            return tmp
 
     @property
     def upload_limit(self) -> int:
@@ -75,7 +89,11 @@ class Settings(BaseSettings):
 
     def initialize_directories(self) -> None:
         for name in ["data/datasets", "models", "experiments"]:
-            (self.root / name).mkdir(parents=True, exist_ok=True)
+            try:
+                (self.root / name).mkdir(parents=True, exist_ok=True)
+            except (OSError, PermissionError):
+                pass
+
 
 @lru_cache
 def get_settings() -> Settings:

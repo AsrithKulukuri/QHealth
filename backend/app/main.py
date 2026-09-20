@@ -37,18 +37,40 @@ logger.propagate = False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
-    manager.start()
+    try:
+        init_db()
+    except Exception as exc:
+        logger.error("init_db_error: %s", exc)
+    try:
+        manager.start()
+    except Exception as exc:
+        logger.error("manager_start_error: %s", exc)
     logger.info("application_started mode=single_workstation_research")
     try:
         yield
     finally:
-        manager.stop()
+        try:
+            manager.stop()
+        except Exception:
+            pass
 
 app = FastAPI(title="EntangleX Q-Health", version="0.1.0", description=DISCLAIMER, lifespan=lifespan)
 app.add_middleware(BodyLimitMiddleware, max_bytes=settings.upload_limit + 65536)
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=[s.strip() for s in settings.trusted_hosts.split(",")])
-app.add_middleware(CORSMiddleware, allow_origins=[s.strip() for s in settings.cors_origins.split(",")], allow_credentials=False, allow_methods=["GET", "POST", "DELETE"], allow_headers=["Content-Type", "Authorization"], expose_headers=["Content-Disposition", "X-Request-ID"])
+
+# Allow Vercel deployments, localhost, and custom domains
+allowed_hosts = [s.strip() for s in settings.trusted_hosts.split(",") if s.strip()]
+if "*" not in allowed_hosts:
+    allowed_hosts.extend(["*.vercel.app", "vercel.app", "*"])
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition", "X-Request-ID"],
+)
 
 @app.middleware("http")
 async def request_context(request: Request, call_next):
@@ -56,10 +78,14 @@ async def request_context(request: Request, call_next):
     try:
         response = await call_next(request)
     except Exception as exc:
-        # Handle here without re-raising through ServerErrorMiddleware, which
-        # could otherwise cause the ASGI server to log raw exception text.
-        logger.error("request_failure request_id=%s exception_type=%s", request.state.request_id, type(exc).__name__)
-        response = JSONResponse({"error": {"code": "internal_error", "message": "The operation failed. Raw biomedical inputs are not logged.", "request_id": request.state.request_id}}, status_code=500)
+        logger.error("request_failure request_id=%s exception_type=%s message=%s", request.state.request_id, type(exc).__name__, str(exc))
+        response = JSONResponse({
+            "error": {
+                "code": "internal_error",
+                "message": f"{type(exc).__name__}: {str(exc)}",
+                "request_id": request.state.request_id
+            }
+        }, status_code=500)
     response.headers["X-Request-ID"] = request.state.request_id
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -72,22 +98,40 @@ async def application_error(request: Request, exc: AppError):
 
 @app.exception_handler(RequestValidationError)
 async def validation_error(request: Request, exc: RequestValidationError):
-    # Never reflect Pydantic's raw 'input' or context containing medical values.
     fields = [{"location": [str(v) for v in err["loc"]], "type": err["type"]} for err in exc.errors()]
-    return JSONResponse({"error": {"code": "validation_error", "message": "Request validation failed. Check the field types and allowed configuration ranges.", "fields": fields, "request_id": getattr(request.state, "request_id", None)}}, status_code=422)
+    return JSONResponse({"error": {"code": "validation_error", "message": "Request validation failed.", "fields": fields, "request_id": getattr(request.state, "request_id", None)}}, status_code=422)
 
 @app.exception_handler(StarletteHTTPException)
 async def http_error(request: Request, exc: StarletteHTTPException):
-    return JSONResponse({"error": {"code": "http_error", "message": "The requested operation is unavailable.", "request_id": getattr(request.state, "request_id", None)}}, status_code=exc.status_code)
+    return JSONResponse({"error": {"code": "http_error", "message": exc.detail or "The requested operation is unavailable.", "request_id": getattr(request.state, "request_id", None)}}, status_code=exc.status_code)
 
 @app.exception_handler(Exception)
 async def unexpected_error(request: Request, exc: Exception):
-    logger.error("request_failure request_id=%s exception_type=%s", getattr(request.state, "request_id", None), type(exc).__name__)
-    return JSONResponse({"error": {"code": "internal_error", "message": "The operation failed. Review installation and configuration; raw biomedical inputs are not logged.", "request_id": getattr(request.state, "request_id", None)}}, status_code=500)
+    logger.error("unexpected_error request_id=%s exception_type=%s: %s", getattr(request.state, "request_id", None), type(exc).__name__, str(exc))
+    return JSONResponse({"error": {"code": "internal_error", "message": f"{type(exc).__name__}: {str(exc)}", "request_id": getattr(request.state, "request_id", None)}}, status_code=500)
 
 @app.get("/api/health", tags=["health"])
 def health():
-    return {"status": "ok", "version": "0.1.0", "mode": "single-workstation research prototype", "authentication_required": bool(settings.api_token), "quantum": availability(), "disclaimer": DISCLAIMER}
+    db_status = "local"
+    if settings.is_postgres_enabled:
+        try:
+            from sqlalchemy import text
+            from .database import engine
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1;"))
+            db_status = "connected (postgresql)"
+        except Exception as exc:
+            db_status = f"unreachable: {type(exc).__name__}"
+    return {
+        "status": "ok",
+        "version": "0.1.0",
+        "mode": "production" if settings.is_postgres_enabled else "local-prototype",
+        "database": db_status,
+        "supabase_storage": "configured" if settings.is_supabase_storage_enabled else "unconfigured",
+        "authentication_required": bool(settings.api_token),
+        "quantum": availability(),
+        "disclaimer": DISCLAIMER,
+    }
 
 api = APIRouter(prefix="/api", dependencies=[Depends(authorize)])
 for router in [datasets.router, pipeline.router, training.router, models.router, experiments.router, quantum.router]:
@@ -95,12 +139,24 @@ for router in [datasets.router, pipeline.router, training.router, models.router,
 
 @api.get("/summary", tags=["dashboard"])
 def summary():
-    with session_scope() as session:
-        counts = {"datasets": session.scalar(select(func.count()).select_from(Dataset)),
-                  "experiments": session.scalar(select(func.count()).select_from(Experiment)),
-                  "ready_models": session.scalar(select(func.count()).select_from(ModelRecord).where(ModelRecord.status == "ready")),
-                  "active_jobs": session.scalar(select(func.count()).select_from(Job).where(Job.status.in_(["queued", "running", "cancel_requested"])))}
-        experiments_recent = [ExperimentOut.model_validate(e).model_dump(mode="json") for e in recent(session, Experiment, 5)]
-    return {"counts": counts, "recent_experiments": experiments_recent, "disclaimer": DISCLAIMER}
+    try:
+        with session_scope() as session:
+            counts = {
+                "datasets": session.scalar(select(func.count()).select_from(Dataset)) or 0,
+                "experiments": session.scalar(select(func.count()).select_from(Experiment)) or 0,
+                "ready_models": session.scalar(select(func.count()).select_from(ModelRecord).where(ModelRecord.status == "ready")) or 0,
+                "active_jobs": session.scalar(select(func.count()).select_from(Job).where(Job.status.in_(["queued", "running", "cancel_requested"]))) or 0,
+            }
+            experiments_recent = [ExperimentOut.model_validate(e).model_dump(mode="json") for e in recent(session, Experiment, 5)]
+        return {"counts": counts, "recent_experiments": experiments_recent, "disclaimer": DISCLAIMER}
+    except Exception as exc:
+        logger.error("summary_fetch_error: %s", exc)
+        return {
+            "counts": {"datasets": 0, "experiments": 0, "ready_models": 0, "active_jobs": 0},
+            "recent_experiments": [],
+            "disclaimer": DISCLAIMER,
+            "warning": f"Database temporarily unavailable: {type(exc).__name__}",
+        }
 
 app.include_router(api)
+
