@@ -110,6 +110,7 @@ async def unexpected_error(request: Request, exc: Exception):
     logger.error("unexpected_error request_id=%s exception_type=%s: %s", getattr(request.state, "request_id", None), type(exc).__name__, str(exc))
     return JSONResponse({"error": {"code": "internal_error", "message": f"{type(exc).__name__}: {str(exc)}", "request_id": getattr(request.state, "request_id", None)}}, status_code=500)
 
+@app.get("/health", tags=["health"])
 @app.get("/api/health", tags=["health"])
 def health():
     db_status = "local"
@@ -134,10 +135,13 @@ def health():
     }
 
 api = APIRouter(prefix="/api", dependencies=[Depends(authorize)])
+api_direct = APIRouter(dependencies=[Depends(authorize)])
 for router in [datasets.router, pipeline.router, training.router, models.router, experiments.router, quantum.router]:
     api.include_router(router)
+    api_direct.include_router(router)
 
 @api.get("/summary", tags=["dashboard"])
+@api_direct.get("/summary", tags=["dashboard"])
 def summary():
     try:
         with session_scope() as session:
@@ -159,4 +163,6 @@ def summary():
         }
 
 app.include_router(api)
+app.include_router(api_direct)
+
 

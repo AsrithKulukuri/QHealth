@@ -24,8 +24,13 @@ if settings.is_postgres_enabled:
     )
     logger.info("postgres_engine_configured schema=%s", settings.effective_schema)
 else:
+    db_dir = settings.root / "data"
+    try:
+        db_dir.mkdir(parents=True, exist_ok=True)
+    except (OSError, PermissionError):
+        pass
     engine = create_engine(
-        f"sqlite:///{settings.root / 'data' / 'qhealth.sqlite3'}",
+        f"sqlite:///{db_dir / 'qhealth.sqlite3'}",
         connect_args={"check_same_thread": False, "timeout": 30},
     )
 
