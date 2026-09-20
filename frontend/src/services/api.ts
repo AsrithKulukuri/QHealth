@@ -7,7 +7,7 @@ async function request(path: string, options: RequestInit = {}): Promise<Respons
   const headers = new Headers(options.headers);
   if (sessionToken) headers.set('Authorization', `Bearer ${sessionToken}`);
   if (options.body && !(options.body instanceof FormData)) headers.set('Content-Type', 'application/json');
-  const response = await fetch(`${base}${path}`, {...options, headers, credentials: 'omit', cache: 'no-store'});
+  const response = await fetch(`${base}${path}`, {...options, headers, credentials: 'same-origin', cache: 'no-store'});
   if (!response.ok) {
     const body = await response.json().catch(() => ({})) as {error?: {message?: string; request_id?: string}};
     const message = body.error?.message || `Request failed (${response.status}).`;
